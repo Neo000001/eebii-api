@@ -47,3 +47,41 @@ async def send_msg(data: SendIn):
     }
     r = requests.post(url, json=body, headers=headers, timeout=20)
     return {"status": r.status_code, "response": r.json()}
+# --- Simple in-memory store for a single connected tenant (MVP) ---
+TENANT = {"phone_id": os.getenv("WA_PHONE_ID"), "token": os.getenv("WA_TOKEN")}
+
+from fastapi import Depends
+
+class ConnectIn(BaseModel):
+    phone_number_id: str
+    access_token: str
+
+@app.post("/wa/connect")
+async def wa_connect(data: ConnectIn):
+    # Save customer's own creds (MVP: in-memory)
+    TENANT["phone_id"] = data.phone_number_id.strip()
+    TENANT["token"] = data.access_token.strip()
+    return {"ok": True}
+
+@app.post("/send2")
+async def send_msg_tenant(data: SendIn):
+    # Use the tenant's saved creds
+    phone_id = TENANT.get("phone_id")
+    token = TENANT.get("token")
+    if not phone_id or not token:
+        raise HTTPException(400, "No WhatsApp account connected yet")
+    url = f"https://graph.facebook.com/v21.0/{phone_id}/messages"
+    headers = {"Authorization": f"Bearer {token}"}
+    body = {
+        "messaging_product":"whatsapp",
+        "to": data.to,
+        "type":"template",
+        "template":{
+            "name": data.template,
+            "language":{"code": data.lang},
+            "components":[{"type":"body","parameters":[{"type":"text","text":v} for v in data.variables]}] if data.variables else []
+        }
+    }
+    r = requests.post(url, json=body, headers=headers, timeout=20)
+    return {"status": r.status_code, "response": r.json()}
+
