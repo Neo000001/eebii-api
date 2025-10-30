@@ -39,6 +39,19 @@ app = FastAPI(
     version="0.1.0",
     dependencies=[Depends(enforce_api_key)]  # all routes protected by default
 )
+# --- API key enforcement middleware ---
+from fastapi.responses import JSONResponse
+
+PUBLIC_PATHS = {"/", "/docs", "/openapi.json", "/webhook/whatsapp"}
+
+@app.middleware("http")
+async def enforce_api_key_global(request, call_next):
+    # Skip check for public endpoints (docs & webhook)
+    if request.url.path not in PUBLIC_PATHS:
+        header_key = request.headers.get("x-api-key")
+        if not header_key or header_key != API_KEY:
+            return JSONResponse(status_code=401, content={"detail": "Invalid API key"})
+    return await call_next(request)
 
 # --------------------------------------------------------------------------------------
 # DB (SQLite)
