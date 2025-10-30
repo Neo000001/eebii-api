@@ -10,6 +10,33 @@ import requests, os, csv, io
 # FastAPI & Config
 # ---------------------------
 app = FastAPI(title="Eebii Notify API")
+# ======================
+# Enable Authorize button in Swagger
+# ======================
+from fastapi.openapi.utils import get_openapi
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    openapi_schema = get_openapi(
+        title=app.title,
+        version="0.1.0",
+        routes=app.routes,
+        description="Eebii WhatsApp Notification API"
+    )
+    openapi_schema.setdefault("components", {}).setdefault("securitySchemes", {})
+    openapi_schema["components"]["securitySchemes"]["APIKeyHeader"] = {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key",
+        "description": "Enter your Eebii Notify API Key here"
+    }
+    openapi_schema["security"] = [{"APIKeyHeader": []}]
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+app.openapi = custom_openapi
+
 
 API_KEY      = os.getenv("API_KEY", "")
 WA_TOKEN     = os.getenv("WA_TOKEN", "")
