@@ -1,8 +1,6 @@
 fastapi==0.115.0
 uvicorn==0.30.6
-python-multipart==0.0.9
 requests==2.32.3
 SQLAlchemy==2.0.36
-pydantic==2.9.2
-pydantic-settings==2.5.2
-
+pydantic==2.9.1
+python-multipart==0.0.9
