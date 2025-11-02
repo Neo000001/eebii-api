@@ -1,59 +1,52 @@
 # main.py
-import os
-import io
-import csv
-from typing import Optional, List, Dict, Any
-
-from fastapi import (
-    FastAPI, HTTPException, Depends, UploadFile, File, Header
-)
+from fastapi import FastAPI, Depends, HTTPException, Header, UploadFile, File, Form
 from fastapi.responses import JSONResponse
-from fastapi.security.api_key import APIKeyHeader
-
-from sqlalchemy import (
-    create_engine, Column, Integer, String, ForeignKey, Text
-)
-from sqlalchemy.orm import sessionmaker, declarative_base, relationship
-
+from typing import Optional, List, Dict, Any
+from pydantic import BaseModel, Field, validator
+from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, Table
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship, Session
 import requests
+import csv, io, os
 
 # =========================
-# Config & Security
+# Config & Auth
 # =========================
-API_KEY = (os.getenv("API_KEY") or "").strip()
-WA_TOKEN = (os.getenv("WA_TOKEN") or "").strip()
-WA_PHONE_ID = (os.getenv("WA_PHONE_ID") or "").strip()
 
+API_KEY = os.getenv("API_KEY", "").strip()
+WA_TOKEN = os.getenv("WA_TOKEN", "").strip()
+WA_PHONE_ID = os.getenv("WA_PHONE_ID", "").strip()
+META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "").strip()
 META_BASE = f"https://graph.facebook.com/v20.0/{WA_PHONE_ID}"
 
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+def _require_wh_env():
+    if not WA_TOKEN or not WA_PHONE_ID:
+        raise HTTPException(status_code=500, detail="WhatsApp env not configured")
 
-async def enforce_api_key(x_api_key: Optional[str] = Depends(api_key_header)):
-    if not API_KEY:
-        # Server misconfiguration → makes it obvious in logs / responses
-        raise HTTPException(status_code=500, detail="Server API key not configured")
-    client = (x_api_key or "").strip()
-    if client != API_KEY:
+async def enforce_api_key(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
+    if not API_KEY or not x_api_key or x_api_key.strip() != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 app = FastAPI(
     title="Eebii Notify API",
     description="Eebii WhatsApp Notification API",
     version="0.1.0",
-    dependencies=[Depends(enforce_api_key)],  # protect all routes by default
+    dependencies=[Depends(enforce_api_key)],
 )
 
-# public endpoints (docs & webhook) – remove global dependency there
-@app.get("/", dependencies=[])
-def root():
-    return {"ok": True, "name": "Eebii Notify API"}
+# =========================
+# Database (SQLite)
+# =========================
 
-# =========================
-# DB (SQLite)
-# =========================
 Base = declarative_base()
 engine = create_engine("sqlite:///./eebii.db", connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+group_members = Table(
+    "group_members",
+    Base.metadata,
+    Column("group_id", Integer, ForeignKey("groups.id"), primary_key=True),
+    Column("contact_id", Integer, ForeignKey("contacts.id"), primary_key=True),
+)
 
 class Contact(Base):
     __tablename__ = "contacts"
@@ -64,27 +57,12 @@ class Contact(Base):
 class Group(Base):
     __tablename__ = "groups"
     id = Column(Integer, primary_key=True)
-    name = Column(String(200), unique=True)
-
-class GroupMember(Base):
-    __tablename__ = "group_members"
-    id = Column(Integer, primary_key=True)
-    group_id = Column(Integer, ForeignKey("groups.id"))
-    contact_id = Column(Integer, ForeignKey("contacts.id"))
-    group = relationship("Group", lazy="joined")
-    contact = relationship("Contact", lazy="joined")
-
-class Media(Base):
-    __tablename__ = "media"
-    id = Column(Integer, primary_key=True)
-    wa_media_id = Column(String(128), index=True)
-    filename = Column(String(255))
-    mime = Column(String(80))
-    note = Column(Text, nullable=True)
+    name = Column(String(200), unique=True, index=True)
+    members = relationship("Contact", secondary=group_members, backref="groups")
 
 Base.metadata.create_all(bind=engine)
 
-def db():
+def db() -> Session:
     s = SessionLocal()
     try:
         yield s
@@ -92,334 +70,335 @@ def db():
         s.close()
 
 # =========================
-# Helpers (Meta senders)
+# Pydantic Schemas
 # =========================
-def _ensure_meta_ready():
-    if not WA_TOKEN or not WA_PHONE_ID:
-        raise HTTPException(status_code=500, detail="WhatsApp API not configured")
 
-def _wa_headers() -> Dict[str, str]:
+class ContactIn(BaseModel):
+    name: str = Field(..., example="Abhilash")
+    phone: str = Field(..., example="+919633511519")
+
+    @validator("phone")
+    def phone_in_e164(cls, v):
+        v = v.strip()
+        if not v.startswith("+") or not v[1:].isdigit():
+            raise ValueError("phone must be E.164 format like +919999999999")
+        return v
+
+class ContactList(BaseModel):
+    id: int
+    name: str
+    phone: str
+
+class GroupCreate(BaseModel):
+    name: str = Field(..., example="Customers")
+
+class GroupAddMembers(BaseModel):
+    group_id: int
+    phones: List[str]
+
+class TextSend(BaseModel):
+    to: str
+    text: str = Field(..., example="Hello from Eebii!")
+
+    @validator("to")
+    def to_e164(cls, v):
+        v = v.strip()
+        if not v.startswith("+") or not v[1:].isdigit():
+            raise ValueError("to must be E.164 format like +91xxxxxxxxxx")
+        return v
+
+class TemplateComponent(BaseModel):
+    type: str = Field(..., example="body")
+    parameters: List[Dict[str, Any]] = Field(default_factory=list)
+
+class TemplateSend(BaseModel):
+    to: str
+    name: str = Field(..., example="hello_world")
+    language: str = Field("en_US", example="en_US")
+    components: Optional[List[TemplateComponent]] = None
+
+    @validator("to")
+    def to_e164(cls, v):
+        v = v.strip()
+        if not v.startswith("+") or not v[1:].isdigit():
+            raise ValueError("to must be E.164 format like +91xxxxxxxxxx")
+        return v
+
+class MediaSend(BaseModel):
+    to: str
+    media_id: str
+    caption: Optional[str] = None
+
+    @validator("to")
+    def to_e164(cls, v):
+        v = v.strip()
+        if not v.startswith("+") or not v[1:].isdigit():
+            raise ValueError("to must be E.164 format like +91xxxxxxxxxx")
+        return v
+
+class BulkItem(BaseModel):
+    to: str
+    type: str  # "text" | "template" | "media"
+    text: Optional[str] = None
+    template: Optional[TemplateSend] = None
+    media: Optional[MediaSend] = None
+
+class BulkPayload(BaseModel):
+    items: List[BulkItem]
+
+# =========================
+# Helpers
+# =========================
+
+def wa_headers() -> Dict[str, str]:
     return {
         "Authorization": f"Bearer {WA_TOKEN}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
 
-def send_text(to: str, text: str) -> Dict[str, Any]:
-    _ensure_meta_ready()
-    url = f"{META_BASE}/messages"
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "text",
-        "text": {"body": text}
-    }
-    r = requests.post(url, headers=_wa_headers(), json=payload, timeout=30)
-    if not r.ok:
-        raise HTTPException(status_code=r.status_code, detail=r.text)
-    return r.json()
+def wa_post(path: str, payload: Dict[str, Any]) -> requests.Response:
+    _require_wh_env()
+    url = f"{META_BASE}{path}"
+    return requests.post(url, headers=wa_headers(), json=payload, timeout=30)
 
-def send_template(to: str, template: str, lang: str = "en_US", variables: Optional[List[str]] = None) -> Dict[str, Any]:
-    _ensure_meta_ready()
-    components = []
-    if variables:
-        components = [{
-            "type": "body",
-            "parameters": [{"type": "text", "text": v} for v in variables]
-        }]
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "template",
-        "template": {
-            "name": template,
-            "language": {"code": lang},
-            "components": components
-        }
-    }
-    r = requests.post(f"{META_BASE}/messages", headers=_wa_headers(), json=payload, timeout=30)
-    if not r.ok:
-        raise HTTPException(status_code=r.status_code, detail=r.text)
-    return r.json()
+# =========================
+# Root / Health
+# =========================
 
-def upload_media_to_meta(file_bytes: bytes, mime: str, filename: str) -> str:
-    _ensure_meta_ready()
-    # NOTE: media upload uses multipart/form-data and different header
-    url = f"{META_BASE}/media"
-    headers = {"Authorization": f"Bearer {WA_TOKEN}"}
-    files = {
-        "file": (filename, file_bytes, mime),
-        "type": (None, mime)
+@app.get("/")
+def root():
+    return {
+        "service": "eebii-notify",
+        "version": "0.1.0",
+        "whatsapp_ready": bool(WA_TOKEN and WA_PHONE_ID),
     }
-    r = requests.post(url, headers=headers, files=files, timeout=60)
-    if not r.ok:
-        raise HTTPException(status_code=r.status_code, detail=r.text)
-    data = r.json()
-    return data.get("id")
-
-def send_media(to: str, wa_media_id: str, mime: str, caption: Optional[str] = None) -> Dict[str, Any]:
-    _ensure_meta_ready()
-    media_type = "image" if mime.startswith("image/") else "document"
-    media_payload = {"id": wa_media_id}
-    if media_type == "document" and caption:
-        media_payload["caption"] = caption
-    if media_type == "image" and caption:
-        media_payload["caption"] = caption
-
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": media_type,
-        media_type: media_payload
-    }
-    r = requests.post(f"{META_BASE}/messages", headers=_wa_headers(), json=payload, timeout=30)
-    if not r.ok:
-        raise HTTPException(status_code=r.status_code, detail=r.text)
-    return r.json()
 
 # =========================
 # Contacts
 # =========================
-@app.get("/contacts", dependencies=[Depends(enforce_api_key)])
-def list_contacts(q: Optional[str] = None, s=Depends(db)):
-    qry = s.query(Contact)
-    if q:
-        like = f"%{q}%"
-        qry = qry.filter((Contact.name.like(like)) | (Contact.phone.like(like)))
-    items = [{"id": c.id, "name": c.name, "phone": c.phone} for c in qry.order_by(Contact.id.desc()).all()]
-    return {"count": len(items), "items": items}
 
-@app.post("/contacts", dependencies=[Depends(enforce_api_key)])
-def add_contact(body: Dict[str, str], s=Depends(db)):
-    name = (body.get("name") or "").strip()
-    phone = (body.get("phone") or "").strip()
-    if not phone:
-        raise HTTPException(status_code=422, detail="phone is required")
-    if s.query(Contact).filter(Contact.phone == phone).first():
-        raise HTTPException(status_code=422, detail="phone already exists")
-    c = Contact(name=name or phone, phone=phone)
-    s.add(c); s.commit()
-    return {"id": c.id, "name": c.name, "phone": c.phone}
+@app.get("/contacts", response_model=List[ContactList])
+def list_contacts(session: Session = Depends(db)):
+    rows = session.query(Contact).order_by(Contact.id.desc()).all()
+    return [ContactList(id=r.id, name=r.name, phone=r.phone) for r in rows]
 
-@app.post("/contacts/import", dependencies=[Depends(enforce_api_key)])
-async def import_contacts(csv_file: UploadFile = File(...), s=Depends(db)):
-    if not csv_file.filename.lower().endswith(".csv"):
-        raise HTTPException(status_code=422, detail="Upload a CSV file")
-    content = await csv_file.read()
-    added = 0
+@app.post("/contacts", response_model=ContactList)
+def add_contact(payload: ContactIn, session: Session = Depends(db)):
+    exists = session.query(Contact).filter(Contact.phone == payload.phone).first()
+    if exists:
+        raise HTTPException(status_code=409, detail="Contact phone already exists")
+    row = Contact(name=payload.name, phone=payload.phone)
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    return ContactList(id=row.id, name=row.name, phone=row.phone)
+
+@app.post("/contacts/import")
+async def import_contacts(file: UploadFile = File(...), session: Session = Depends(db)):
+    if not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Upload a CSV file")
+    content = await file.read()
     reader = csv.DictReader(io.StringIO(content.decode("utf-8")))
+    added, skipped = 0, 0
     for row in reader:
-        phone = (row.get("phone") or "").strip()
         name = (row.get("name") or "").strip()
-        if not phone:
+        phone = (row.get("phone") or "").strip()
+        if not name or not phone:
+            skipped += 1
             continue
-        if s.query(Contact).filter(Contact.phone == phone).first():
+        if not (phone.startswith("+") and phone[1:].isdigit()):
+            skipped += 1
             continue
-        s.add(Contact(name=name or phone, phone=phone))
+        if session.query(Contact).filter(Contact.phone == phone).first():
+            skipped += 1
+            continue
+        session.add(Contact(name=name, phone=phone))
         added += 1
-    s.commit()
-    return {"added": added}
+    session.commit()
+    return {"added": added, "skipped": skipped}
 
 # =========================
 # Groups
 # =========================
-@app.get("/groups", dependencies=[Depends(enforce_api_key)])
-def list_groups(s=Depends(db)):
-    items = [{"id": g.id, "name": g.name} for g in s.query(Group).order_by(Group.id.desc()).all()]
-    return {"count": len(items), "items": items}
 
-@app.post("/groups", dependencies=[Depends(enforce_api_key)])
-def create_group(body: Dict[str, str], s=Depends(db)):
-    name = (body.get("name") or "").strip()
-    if not name:
-        raise HTTPException(status_code=422, detail="name is required")
-    if s.query(Group).filter(Group.name == name).first():
-        raise HTTPException(status_code=422, detail="group already exists")
-    g = Group(name=name)
-    s.add(g); s.commit()
+@app.get("/groups")
+def list_groups(session: Session = Depends(db)):
+    groups = session.query(Group).order_by(Group.id.desc()).all()
+    return [{"id": g.id, "name": g.name, "members": len(g.members)} for g in groups]
+
+@app.post("/groups")
+def create_group(payload: GroupCreate, session: Session = Depends(db)):
+    if session.query(Group).filter(Group.name == payload.name).first():
+        raise HTTPException(status_code=409, detail="Group name already exists")
+    g = Group(name=payload.name)
+    session.add(g)
+    session.commit()
+    session.refresh(g)
     return {"id": g.id, "name": g.name}
 
-@app.post("/groups/add", dependencies=[Depends(enforce_api_key)])
-def add_members(body: Dict[str, Any], s=Depends(db)):
-    gid = body.get("group_id")
-    phones = body.get("phones") or []
-    g = s.query(Group).get(gid)
+@app.get("/groups/{gid}/members")
+def group_members_list(gid: int, session: Session = Depends(db)):
+    g = session.query(Group).get(gid)
     if not g:
-        raise HTTPException(status_code=404, detail="group not found")
+        raise HTTPException(status_code=404, detail="Group not found")
+    return [{"id": c.id, "name": c.name, "phone": c.phone} for c in g.members]
+
+@app.post("/groups/add")
+def add_members(payload: GroupAddMembers, session: Session = Depends(db)):
+    g = session.query(Group).get(payload.group_id)
+    if not g:
+        raise HTTPException(status_code=404, detail="Group not found")
     added = 0
-    for p in phones:
-        contact = s.query(Contact).filter(Contact.phone == p).first()
-        if not contact:
-            contact = Contact(name=p, phone=p)
-            s.add(contact); s.flush()
-        exists = (
-            s.query(GroupMember)
-            .filter(GroupMember.group_id == g.id, GroupMember.contact_id == contact.id)
-            .first()
-        )
-        if not exists:
-            s.add(GroupMember(group_id=g.id, contact_id=contact.id))
+    for p in payload.phones:
+        p = p.strip()
+        if not (p.startswith("+") and p[1:].isdigit()):
+            continue
+        c = session.query(Contact).filter(Contact.phone == p).first()
+        if not c:
+            c = Contact(name=p, phone=p)
+            session.add(c)
+            session.flush()
+        if c not in g.members:
+            g.members.append(c)
             added += 1
-    s.commit()
-    return {"group_id": g.id, "added": added}
-
-@app.get("/groups/{gid}/members", dependencies=[Depends(enforce_api_key)])
-def group_members(gid: int, s=Depends(db)):
-    g = s.query(Group).get(gid)
-    if not g:
-        raise HTTPException(status_code=404, detail="group not found")
-    members = (
-        s.query(GroupMember)
-        .filter(GroupMember.group_id == g.id)
-        .all()
-    )
-    items = [{"id": m.contact.id, "name": m.contact.name, "phone": m.contact.phone} for m in members]
-    return {"group": {"id": g.id, "name": g.name}, "count": len(items), "items": items}
+    session.commit()
+    return {"group_id": g.id, "added": added, "members": len(g.members)}
 
 # =========================
-# Templates (Meta)
+# WhatsApp Sending
 # =========================
-@app.get("/templates", dependencies=[Depends(enforce_api_key)])
-def list_templates():
-    _ensure_meta_ready()
-    url = f"https://graph.facebook.com/v20.0/{os.getenv('WABA_ID')}/message_templates"
-    # If you don’t have WABA_ID set yet, fall back to /phone_number/templates (limited)
-    alt_url = f"{META_BASE}/message_templates"
-    headers = {"Authorization": f"Bearer {WA_TOKEN}"}
-    r = requests.get(url, headers=headers, timeout=30)
-    if r.status_code == 400 or r.status_code == 403:
-        r = requests.get(alt_url, headers=headers, timeout=30)
-    if not r.ok:
-        raise HTTPException(status_code=r.status_code, detail=r.text)
+
+@app.post("/send/text")
+def send_text(payload: TextSend):
+    _require_wh_env()
+    body = {
+        "messaging_product": "whatsapp",
+        "to": payload.to.replace("+", ""),
+        "type": "text",
+        "text": {"preview_url": False, "body": payload.text},
+    }
+    r = wa_post("/messages", body)
+    if r.status_code >= 400:
+        return JSONResponse(status_code=r.status_code, content=r.json())
     return r.json()
 
-# =========================
-# Sending
-# =========================
-@app.post("/send/text", dependencies=[Depends(enforce_api_key)])
-def api_send_text(body: Dict[str, str]):
-    to = (body.get("to") or "").strip()
-    text = (body.get("text") or body.get("message") or "").strip()
-    if not to or not text:
-        raise HTTPException(status_code=400, detail="to and text are required")
-    return send_text(to, text)
+@app.post("/send/template")
+def send_template(payload: TemplateSend):
+    _require_wh_env()
+    tpl: Dict[str, Any] = {
+        "name": payload.name,
+        "language": {"code": payload.language},
+    }
+    if payload.components:
+        tpl["components"] = [c.dict() for c in payload.components]
+    body = {
+        "messaging_product": "whatsapp",
+        "to": payload.to.replace("+", ""),
+        "type": "template",
+        "template": tpl,
+    }
+    r = wa_post("/messages", body)
+    if r.status_code >= 400:
+        return JSONResponse(status_code=r.status_code, content=r.json())
+    return r.json()
 
-@app.post("/send/template", dependencies=[Depends(enforce_api_key)])
-def api_send_template(body: Dict[str, Any]):
-    to = (body.get("to") or "").strip()
-    template = (body.get("template") or "").strip()
-    lang = (body.get("lang") or "en_US").strip()
-    variables = body.get("variables") or []
-    if not to or not template:
-        raise HTTPException(status_code=400, detail="to and template are required")
-    return send_template(to, template, lang, variables)
+@app.post("/media/upload")
+async def media_upload(file: UploadFile = File(...)):
+    _require_wh_env()
+    # Upload media to Meta
+    url = f"{META_BASE}/media"
+    headers = {"Authorization": f"Bearer {WA_TOKEN}"}
+    files = {"file": (file.filename, await file.read(), file.content_type)}
+    data = {"messaging_product": "whatsapp"}
+    rr = requests.post(url, headers=headers, files=files, data=data, timeout=60)
+    if rr.status_code >= 400:
+        return JSONResponse(status_code=rr.status_code, content=rr.json())
+    return rr.json()  # { "id": "<media_id>" }
 
-@app.post("/media/upload", dependencies=[Depends(enforce_api_key)])
-async def api_media_upload(file: UploadFile = File(...), note: Optional[str] = None, s=Depends(db)):
-    data = await file.read()
-    wa_id = upload_media_to_meta(data, file.content_type or "application/octet-stream", file.filename or "file")
-    m = Media(wa_media_id=wa_id, filename=file.filename, mime=file.content_type or "application/octet-stream", note=note)
-    s.add(m); s.commit()
-    return {"media_id": m.id, "wa_media_id": wa_id, "filename": m.filename, "mime": m.mime}
-
-@app.post("/send/media", dependencies=[Depends(enforce_api_key)])
-def api_send_media(body: Dict[str, Any], s=Depends(db)):
-    to = (body.get("to") or "").strip()
-    wa_media_id = (body.get("wa_media_id") or "").strip()
-    caption = (body.get("caption") or "").strip() or None
-    if not to or not wa_media_id:
-        raise HTTPException(status_code=400, detail="to and wa_media_id are required")
-    media = s.query(Media).filter(Media.wa_media_id == wa_media_id).first()
-    mime = media.mime if media else "application/octet-stream"
-    return send_media(to, wa_media_id, mime, caption)
+@app.post("/send/media")
+def send_media(payload: MediaSend):
+    _require_wh_env()
+    body = {
+        "messaging_product": "whatsapp",
+        "to": payload.to.replace("+", ""),
+        "type": "image",
+        "image": {"id": payload.media_id},
+    }
+    if payload.caption:
+        body["image"]["caption"] = payload.caption
+    r = wa_post("/messages", body)
+    if r.status_code >= 400:
+        return JSONResponse(status_code=r.status_code, content=r.json())
+    return r.json()
 
 # =========================
 # Bulk
 # =========================
-@app.post("/bulk/preview", dependencies=[Depends(enforce_api_key)])
-def bulk_preview(body: Dict[str, Any], s=Depends(db)):
-    """
-    Body:
-      {
-        "group_id": 1,  (optional)
-        "phones": ["+91..."],  (optional)
-        "mode": "text" | "template" | "media",
-        "text": "...",
-        "template": {"name":"hello_world","lang":"en_US","variables":["A","B"]},
-        "media": {"wa_media_id":"...", "caption": "..."}
-      }
-    """
-    mode = (body.get("mode") or "text").strip()
-    phones: List[str] = body.get("phones") or []
-    gid = body.get("group_id")
-    if gid:
-        members = (
-            s.query(GroupMember)
-            .filter(GroupMember.group_id == gid)
-            .all()
-        )
-        phones.extend([m.contact.phone for m in members])
-    phones = sorted(list({p.strip() for p in phones if p and p.strip()}))
-    if not phones:
-        raise HTTPException(status_code=422, detail="No recipients found")
-    preview = {"count": len(phones), "phones": phones, "mode": mode}
-    if mode == "text":
-        preview["text"] = body.get("text") or ""
-    elif mode == "template":
-        preview["template"] = body.get("template") or {}
-    elif mode == "media":
-        preview["media"] = body.get("media") or {}
-    else:
-        raise HTTPException(status_code=422, detail="Unknown mode")
-    return preview
 
-@app.post("/send/bulk", dependencies=[Depends(enforce_api_key)])
-def bulk_send(body: Dict[str, Any], s=Depends(db)):
-    mode = (body.get("mode") or "text").strip()
-    phones: List[str] = body.get("phones") or []
-    gid = body.get("group_id")
-    if gid:
-        members = s.query(GroupMember).filter(GroupMember.group_id == gid).all()
-        phones.extend([m.contact.phone for m in members])
-    phones = sorted(list({p.strip() for p in phones if p and p.strip()}))
-    if not phones:
-        raise HTTPException(status_code=422, detail="No recipients found")
+@app.post("/bulk/preview")
+def bulk_preview(payload: BulkPayload):
+    count = len(payload.items or [])
+    types = {i.type for i in payload.items}
+    return {"items": count, "types": sorted(list(types))}
 
-    sent, failed = [], []
-    for p in phones:
+@app.post("/send/bulk")
+def send_bulk(payload: BulkPayload):
+    results = []
+    for item in payload.items:
         try:
-            if mode == "text":
-                txt = (body.get("text") or "").strip()
-                send_text(p, txt)
-            elif mode == "template":
-                tpl = body.get("template") or {}
-                send_template(p, tpl.get("name", ""), tpl.get("lang", "en_US"), tpl.get("variables", []))
-            elif mode == "media":
-                media = body.get("media") or {}
-                wa_id = (media.get("wa_media_id") or "").strip()
-                caption = (media.get("caption") or None)
-                if not wa_id:
-                    raise ValueError("wa_media_id missing")
-                db_media = s.query(Media).filter(Media.wa_media_id == wa_id).first()
-                mime = db_media.mime if db_media else "application/octet-stream"
-                send_media(p, wa_id, mime, caption)
+            if item.type == "text" and item.text and item.to:
+                res = send_text(TextSend(to=item.to, text=item.text))
+            elif item.type == "template" and item.template:
+                res = send_template(item.template)
+            elif item.type == "media" and item.media:
+                res = send_media(item.media)
             else:
-                raise ValueError("Unknown mode")
-            sent.append(p)
-        except Exception as e:
-            failed.append({"phone": p, "error": str(e)})
-    return {"requested": len(phones), "sent": len(sent), "failed": failed}
+                res = {"error": "invalid bulk item"}
+        except HTTPException as e:
+            res = {"status_code": e.status_code, "detail": e.detail}
+        results.append(res)
+    return {"results": results}
 
 # =========================
-# Webhook (public)
+# Webhooks
 # =========================
-@app.get("/webhook/whatsapp", dependencies=[])
-def verify(mode: Optional[str] = None, challenge: Optional[str] = None, token: Optional[str] = None):
-    verify_token = (os.getenv("META_VERIFY_TOKEN") or "").strip()
-    if token and verify_token and token == verify_token:
-        return JSONResponse(content=challenge or "")
-    raise HTTPException(status_code=403, detail="Verification failed")
 
-@app.post("/webhook/whatsapp", dependencies=[])
-def receive(body: Dict[str, Any]):
-    # You can expand this to log or route inbound messages
+@app.get("/webhook/whatsapp")
+def verify_whatsapp(mode: Optional[str] = None,
+                    challenge: Optional[str] = None,
+                    verify_token: Optional[str] = Header(None, alias="hub.verify_token"),
+                    hub_mode: Optional[str] = Header(None, alias="hub.mode"),
+                    hub_challenge: Optional[str] = Header(None, alias="hub.challenge"),
+                    q_mode: Optional[str] = None,
+                    q_token: Optional[str] = None,
+                    q_challenge: Optional[str] = None):
+    # Meta calls with query params: hub.mode, hub.verify_token, hub.challenge
+    # FastAPI header tricks can be flaky here; use request.query_params usually.
+    # Simpler: pull from query via dependency injection is verbose,
+    # so we’ll accept both styles by reading the environment token only.
+    from fastapi import Request
+    # Re-parse query:
+    # (workaround due to some gateways)
+    return JSONResponse(content={"detail": "Use query params"}, status_code=200)
+
+from fastapi import Request
+@app.get("/webhook/whatsapp")
+async def webhook_verify(request: Request):
+    params = dict(request.query_params)
+    mode = params.get("hub.mode")
+    token = params.get("hub.verify_token")
+    challenge = params.get("hub.challenge")
+    if mode == "subscribe" and token == META_VERIFY_TOKEN:
+        return JSONResponse(content=challenge, media_type="text/plain")
+    raise HTTPException(status_code=403, detail="Forbidden")
+
+@app.post("/webhook/whatsapp")
+async def webhook_receive(data: Dict[str, Any]):
+    # For now, just echo what Meta sends (message status, inbound, etc.)
     return {"received": True}
+
+# =========================
+# Run (local)
+# =========================
+
+# Local dev: uvicorn main:app --reload --port 8000
