@@ -36,6 +36,15 @@ async def enforce_api_key(
     if not API_KEY or not x_api_key or x_api_key.strip() != API_KEY:
         # Do NOT leak the expected key — just say it's invalid
         raise HTTPException(status_code=401, detail="Invalid API key")
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://notify.eebii.com"],  # lock to your portal
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ====================================
 # FastAPI app
