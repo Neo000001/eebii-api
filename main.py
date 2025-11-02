@@ -25,6 +25,41 @@ def _require_wh_env():
 async def enforce_api_key(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
     if not API_KEY or not x_api_key or x_api_key.strip() != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
+from fastapi.security.api_key import APIKeyHeader
+from fastapi.openapi.models import APIKey, APIKeyIn
+from fastapi.openapi.utils import get_openapi
+
+api_key_scheme = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+app = FastAPI(
+    title="Eebii Notify API",
+    description="Eebii WhatsApp Notification API",
+    version="0.1.0",
+    dependencies=[Depends(enforce_api_key)],
+)
+
+# 👇 Add OpenAPI override for "Authorize" button
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    openapi_schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    openapi_schema["components"]["securitySchemes"] = {
+        "apiKey": {
+            "type": "apiKey",
+            "name": "X-API-Key",
+            "in": "header"
+        }
+    }
+    openapi_schema["security"] = [{"apiKey": []}]
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+app.openapi = custom_openapi
 
 app = FastAPI(
     title="Eebii Notify API",
